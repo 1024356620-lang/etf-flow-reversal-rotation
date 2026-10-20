@@ -1,14 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 中泰证券 ETF资金流反转效应 指数轮动策略 复现
-单文件完整版，pandas 2.x 兼容
-
-核心逻辑：
-- 样本池：指数上日 ETF 跟踪规模 > 4 亿，机构占比 < 70%
-- 因子：10 日累计资金流强度（截面分位）
-- 调仓：月度，月初首个交易日收盘
-- 选股：剔除资金流入（flow_pct > 0.5），选资金流出最强 TOP5，等权
-- 约束：至少 3 个宽基；宽基去重
 """
 
 import glob
@@ -61,6 +53,7 @@ SECTOR_KEYWORDS = {
 # ==================== 数据目录设置 ====================
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, 'raw_data')
+
 
 # ==================== 工具 ====================
 def _ensure_columns(df, rename_map):
@@ -201,7 +194,7 @@ def build_universe(index_flow, index_daily, inst_ratio, mapping, index_name,
     result = []
     for idx, g in df.groupby('index_code', sort=False):
         g = g.copy()
-        g['index_code'] = idx
+        g['index_code'] = idx  # groupby 后 index_code 变 index，手动补回
         sub = inst_index[inst_index['index_code'] == idx]
         if sub.empty:
             g['inst_ratio'] = np.nan
@@ -303,7 +296,7 @@ def backtest(universe, factor_df, top_n=5, freq='M', cost=0.001,
         if cross.empty:
             continue
 
-        # 剔除资金流入：用截面分位 <= 0.5（相对阈值），而非 flow_cum <= 0（绝对阈值）
+        # 剔除资金流入：用截面分位 <= 0.5（相对阈值）
         neg = cross[cross['flow_pct'] <= 0.5]
         pool = neg if len(neg) >= top_n else cross
 
@@ -396,12 +389,11 @@ def yearly_performance(returns):
 
 # ==================== 真实数据读取 ====================
 def load_real_data():
-    # 抑制 openpyxl 读取无样式 Excel 时的 UserWarning
     warnings.filterwarnings('ignore', message='Workbook contains no default style')
 
     print('\n[1/5] 读取CSMAR数据...')
 
-    # 1. ETF 基本信息
+    # 清洗 ETF 基础信息与指数映射
     etf_info = pd.read_excel(os.path.join(DATA_DIR, 'ETF.csv'))
     etf_info = etf_info.rename(columns={
         '证券代码': 'etf_code',
@@ -429,7 +421,7 @@ def load_real_data():
           '| 唯一 ETF:', mapping['etf_code'].nunique(),
           '| 唯一指数:', mapping['index_code'].nunique())
 
-    # 2. ETF 日行情
+    # 合并 ETF 日行情并处理份额缺失
     etf_files = sorted(glob.glob(os.path.join(DATA_DIR, 'FUND_MKT_Quotation*.csv')))
     print('  ETF 日行情文件:', [os.path.basename(f) for f in etf_files])
     etf_list = []
@@ -468,7 +460,7 @@ def load_real_data():
     etf_daily['etf_flow'] = etf_daily['share_chg'] * etf_daily['close']
     etf_daily['etf_size'] = etf_daily['shares'] * etf_daily['close']
 
-    # 3. 指数日行情
+    # 读取指数日行情
     index_daily = pd.read_csv(os.path.join(DATA_DIR, 'csmar_index_daily_clean.csv'),
                               parse_dates=['trade_date'], dtype={'index_code': str},
                               low_memory=False)
@@ -483,7 +475,7 @@ def load_real_data():
           '| 指数数:', index_daily['index_code'].nunique(),
           '| 与 ETF 映射交集:', len(set(index_daily['index_code']) & set(mapping['index_code'])))
 
-    # 4. 机构占比
+    # 处理机构占比
     inst_ratio = pd.read_csv(os.path.join(DATA_DIR, 'Fund_HolderStructure.csv'))
     inst_ratio = inst_ratio.rename(columns={
         'Symbol': 'etf_code',
@@ -503,7 +495,7 @@ def load_real_data():
     print('  机构占比:', inst_ratio.shape,
           '| ETF 数:', inst_ratio['etf_code'].nunique())
 
-    # 5. 基准：优先 wind_all_a，其次 000985 中证全指，最后 000300
+    # 基准对齐
     wind_path = os.path.join(DATA_DIR, 'wind_all_a.csv')
     if os.path.exists(wind_path):
         benchmark = pd.read_csv(wind_path, parse_dates=['trade_date'])
