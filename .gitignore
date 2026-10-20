@@ -1,0 +1,21 @@
+# 忽略原始数据
+raw_data/
+*.csv
+*.xlsx
+*.xls
+
+# 允许通过
+!data/README.md
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 虚拟环境
+venv/
+.venv/
