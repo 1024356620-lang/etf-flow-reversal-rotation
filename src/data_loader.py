@@ -45,12 +45,12 @@ def _clean_index_code(s: str) -> str:
 
 
 def _load_trading_calendar(index_daily: pd.DataFrame) -> pd.DatetimeIndex:
-    """以指数行情中出现过的日期作为权威交易日历。
-    注意：这里只取'全体指数都有数据的日期'的交集，避免混入单一指数的异常日期。"""
-    counts = index_daily.groupby('trade_date')['index_code'].nunique()
-    threshold = max(1, int(counts.max() * 0.5))
-    cal = counts[counts >= threshold].index
-    return pd.DatetimeIndex(sorted(cal))
+    """以沪深300或上证指数行情日期作为权威交易日历。"""
+    for code in ('000300', '000001', '000985'):
+        sub = index_daily[index_daily['index_code'] == code]
+        if len(sub) > 0:
+            return pd.DatetimeIndex(sorted(sub['trade_date'].unique()))
+    return pd.DatetimeIndex(sorted(index_daily['trade_date'].unique()))
 
 
 def load_real_data(config: StrategyConfig) -> MarketData:

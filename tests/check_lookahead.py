@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""检查 flow_cum_std 是否使用未来数据。
+"""检查 flow_cum / flow_pct 是否使用未来数据。
 
-方法：用完整数据算因子 vs 截断到 T 日算因子，比较 T 日及以前的 flow_cum_std。
-若差异 > 1e-10，说明标准化用了未来数据。
+方法：用完整数据算因子 vs 截断到 T 日算因子，比较 T 日及以前的取值。
+若差异 > 1e-10，说明用了未来数据，脚本返回非零退出码。
 
 用法：python tests/check_lookahead.py
 """
@@ -20,7 +20,7 @@ from data_loader import load_real_data
 from factor import compute_index_flow, compute_flow_factor
 
 
-def main():
+def main() -> bool:
     config = StrategyConfig(min_etf_size=5e8)
     print('加载数据...')
     data = load_real_data(config)
@@ -32,13 +32,14 @@ def main():
         config.factor_window, config.factor_min_periods)
 
     cutoffs = [
-        pd.Timestamp('2020-02-14'),   # Q1 中间
-        pd.Timestamp('2021-05-20'),   # Q2 中间
-        pd.Timestamp('2022-08-15'),   # Q3 中间
-        pd.Timestamp('2023-11-15'),   # Q4 中间
-        pd.Timestamp('2025-05-15'),   # Q2 中间
+        pd.Timestamp('2020-02-14'),
+        pd.Timestamp('2021-05-20'),
+        pd.Timestamp('2022-08-15'),
+        pd.Timestamp('2023-11-15'),
+        pd.Timestamp('2025-05-15'),
     ]
 
+    failures = []
     for cutoff in cutoffs:
         print(f'\n截断到 {cutoff.date()}...')
         etf_cut = data.etf_daily[data.etf_daily['trade_date'] <= cutoff]
@@ -64,11 +65,19 @@ def main():
         diff_cum = (merged['flow_cum_full'] - merged['flow_cum_cut']).abs()
         diff_pct = (merged['flow_pct_full'] - merged['flow_pct_cut']).abs()
 
-        # flow_cum_std 已删除；只检查 flow_cum 和 flow_pct 无前视
         print(f'  重叠记录: {len(merged)}')
-        print(f'  flow_cum      最大差异: {diff_cum.max():.3e}')
-        print(f'  flow_pct      最大差异: {diff_pct.max():.3e}')
+        print(f'  flow_cum  最大差异: {diff_cum.max():.3e}')
+        print(f'  flow_pct  最大差异: {diff_pct.max():.3e}')
+
+        if diff_cum.max() > 1e-10 or diff_pct.max() > 1e-10:
+            print('  >>> flow_cum 或 flow_pct 使用了未来数据（前视）')
+            failures.append(cutoff)
+        else:
+            print('  flow_cum / flow_pct 无前视')
+
+    print('\n结论:', 'PASS' if not failures else f'FAIL（{len(failures)} 个截断点）')
+    return not failures
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(0 if main() else 1)

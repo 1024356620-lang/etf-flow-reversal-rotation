@@ -8,17 +8,17 @@
   - 调仓日：先按旧权重算 R_t 并归一化，再设新权重
     新持仓等权，总资产仓位 gross = n/top_n，cash = 1 - gross
 
-成本口径（统一基数）：
+成本口径：
   - traded_fraction 是证券买卖金额 / 当日收盘扣费前净资产
   - fee_fraction = traded_fraction * cost_rate，占当日扣费前净资产
   - cost = (1 + market_ret) * fee_fraction，换算成占上日净资产
-  - net_ret = market_ret - cost，三者同基数（相对上日净资产）
+  - net_ret = market_ret - cost
   - turnover 含现金，仅用于统计资产配置变化
 
-空仓分支：
-  - old_weights 写换仓前漂移权重，new_weights 为空
-  - turnover 含现金，sum(|new-old|)/2，与非空仓分支一致
-  - traded_fraction 只含证券，cost 只按证券计费
+缺失收益：
+  - ret_panel 不 fillna，保留 NaN
+  - 只对实际持仓（weights.index）取收益；有 NaN 直接 raise
+  - “未持仓资产的缺失”（如上市前）不会误报
 """
 from typing import Dict, List
 
@@ -33,7 +33,7 @@ def run_backtest(holdings_by_date: Dict[pd.Timestamp, List[str]],
                  top_n: int = 5,
                  return_details: bool = False):
     cal = pd.DatetimeIndex(sorted(trading_calendar))
-    ret_panel = full_returns.reindex(cal).fillna(0.0)
+    ret_panel = full_returns.reindex(cal)   # 不 fillna，保留 NaN
 
     records = []
     weight_rows = []
@@ -58,6 +58,9 @@ def run_backtest(holdings_by_date: Dict[pd.Timestamp, List[str]],
             # 1) 当日收益按旧权重（含现金，现金收益 0），归一化漂移
             if len(weights) > 0:
                 r_today = ret_panel.loc[date, weights.index]
+                if r_today.isna().any():
+                    bad = r_today[r_today.isna()].index.tolist()
+                    raise ValueError(f'{date.date()} 调仓日旧持仓收益缺失: {bad}')
                 market_ret = float((weights * r_today).sum())
                 denom = 1.0 + market_ret
                 drifted = weights * (1 + r_today) / denom
@@ -144,6 +147,9 @@ def run_backtest(holdings_by_date: Dict[pd.Timestamp, List[str]],
         else:
             if len(weights) > 0:
                 r_today = ret_panel.loc[date, weights.index]
+                if r_today.isna().any():
+                    bad = r_today[r_today.isna()].index.tolist()
+                    raise ValueError(f'{date.date()} 持仓收益缺失: {bad}')
                 market_ret = float((weights * r_today).sum())
                 denom = 1.0 + market_ret
                 weights = weights * (1 + r_today) / denom

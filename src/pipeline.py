@@ -21,21 +21,22 @@ from backtest import run_backtest
 from performance import evaluate, yearly_performance
 
 
-def _monthly_pools(universe, factor_df, config):
+def _monthly_pools(universe, factor_df, config, trading_calendar):
+    cal = pd.DataFrame({'trade_date': pd.DatetimeIndex(sorted(trading_calendar))})
+    cal['period'] = cal['trade_date'].dt.to_period(config.rebalance_freq)
+    first_dates = cal.groupby('period')['trade_date'].min()
+
     df = universe.merge(
         factor_df[['index_code', 'trade_date', 'flow_cum', 'flow_pct']],
         on=['index_code', 'trade_date'], how='left').dropna(subset=['flow_cum'])
-    df['period'] = df['trade_date'].dt.to_period(config.rebalance_freq)
-    first_dates = df.groupby('period')['trade_date'].min()
 
     pools = {}
     for period, date in first_dates.items():
         cross = df[df['trade_date'] == date].copy()
         if config.flow_filter_mode == 'absolute':
             pool = cross[cross['flow_cum'] <= 0]
-        else:  # percentile
+        else:
             pool = cross[cross['flow_pct'] <= 0.5]
-        # 去掉 fallback：候选不足时保留 pool 原样，由 selector 按 n/top_n 降仓
         pools[date] = pool
     return pools
 
@@ -80,7 +81,7 @@ def run_with_data(config: StrategyConfig, data, out_dir=None) -> dict:
     print('[选股] 逐月生成持仓...')
     name_map = dict(zip(data.index_name['index_code'],
                         data.index_name['index_name']))
-    pools = _monthly_pools(universe, factor_df, config)
+    pools = _monthly_pools(universe, factor_df, config, data.trading_calendar)
     holdings_by_date, diagnostics = {}, []
     for date, pool in pools.items():
         holdings, diag = select_holdings(pool, config, name_map,
