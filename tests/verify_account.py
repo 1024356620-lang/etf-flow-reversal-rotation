@@ -10,6 +10,7 @@
   - cost = (1 + market_ret) * fee_fraction（占上日净资产）
   - net_ret = market_ret - cost
   - 选仓约束：n_selected<=5, non_broad_n<=2, 宽基不足时 n_selected<=broad_n+2
+  - 空仓日（n_holdings=0）和上日空仓的调仓日不要求 holdings_returns 覆盖
 
 失败返回非零退出码。
 """
@@ -22,7 +23,7 @@ COST_RATE = 0.001
 TOL = 1e-10
 
 
-def _parse_weights(s: str) -> dict:
+def _parse_weights(s) -> dict:
     if not isinstance(s, str) or not s.strip():
         return {}
     out = {}
@@ -62,7 +63,7 @@ def main() -> bool:
     else:
         print(f'  全部 {len(total)} 天满足，最大偏差 {diff_total.max():.3e}')
 
-    # [A] 收益覆盖
+    # [A] 收益覆盖（跳过空仓日、上日空仓的调仓日）
     print('\n[A] 收益覆盖')
     missing_ret, prev_w = [], pd.Series(dtype=float)
     for d in all_dates:
@@ -74,6 +75,7 @@ def main() -> bool:
                     missing_ret.append((d, code))
         day_w = w_pivot.loc[d] if d in w_pivot.index else pd.Series(dtype=float)
         prev_w = day_w[day_w > 0]
+
     dropped = sorted(set(w_pivot.columns[w_pivot.sum(axis=0) > 0]) - set(ret_panel.columns))
     if dropped:
         fail(f'权重中有 {len(dropped)} 个代码在收益表中不存在: {dropped[:10]}')
@@ -81,13 +83,22 @@ def main() -> bool:
         fail(f'收益缺失/非有限: {len(missing_ret)} 条，示例 {missing_ret[:5]}')
     else:
         print('  上日权重 > 0 的资产收益全部存在且有限。')
+
     first_rb = rb['trade_date'].min()
-    missing_dates = [d for d in all_dates
-                     if d not in set(hr['trade_date'].unique()) and d > first_rb]
+    no_holding_dates = set(acct.index[acct['n_holdings'] == 0])
+    hr_dates = set(hr['trade_date'].unique())
+    missing_dates = []
+    for d in all_dates:
+        if d <= first_rb or d in hr_dates or d in no_holding_dates:
+            continue
+        prev_idx = acct.index.get_loc(d)
+        if prev_idx == 0 or acct.iloc[prev_idx - 1]['n_holdings'] == 0:
+            continue
+        missing_dates.append(d)
     if missing_dates:
-        fail(f'holdings_returns 未覆盖 {len(missing_dates)} 天')
+        fail(f'holdings_returns 未覆盖 {len(missing_dates)} 个非空仓日，示例 {missing_dates[:5]}')
     else:
-        print('  holdings_returns 覆盖账本全部持仓日期。')
+        print('  holdings_returns 覆盖账本全部非空仓持仓日期。')
 
     # [B] market_ret 复算
     print('\n[B] market_ret 复算')
@@ -98,7 +109,7 @@ def main() -> bool:
     if diff_mr.max() > TOL:
         fail(f'market_ret 最大误差 {diff_mr.max():.3e}')
 
-    # [C] 权重漂移
+    # [C] 权重漂移（含空仓分支）
     print('\n[C] 权重漂移')
     rb_by_date = {r['trade_date']: r for _, r in rb.iterrows()}
     drift_non, drift_old, post = [], [], []
@@ -118,15 +129,17 @@ def main() -> bool:
                 diff = (old_w.reindex(codes).fillna(0) - exp_w.reindex(codes).fillna(0)).abs().max()
                 if diff > TOL:
                     drift_old.append((d, float(diff)))
-                if abs(float(rb_by_date[d]['old_cash_weight']) - exp_cash) > TOL:
-                    drift_old.append((d, abs(float(rb_by_date[d]['old_cash_weight']) - exp_cash)))
+                old_cash_file = float(rb_by_date[d]['old_cash_weight'])
+                if abs(old_cash_file - exp_cash) > TOL:
+                    drift_old.append((d, abs(old_cash_file - exp_cash)))
                 new_w = pd.Series(_parse_weights(rb_by_date[d]['new_weights']))
                 codes = set(day_w.index) | set(new_w.index)
                 diff_post = (day_w.reindex(codes).fillna(0) - new_w.reindex(codes).fillna(0)).abs().max()
                 if diff_post > TOL:
                     post.append((d, float(diff_post)))
-                if abs(day_cash - float(rb_by_date[d]['new_cash_weight'])) > TOL:
-                    post.append((d, abs(day_cash - float(rb_by_date[d]['new_cash_weight']))))
+                new_cash_file = float(rb_by_date[d]['new_cash_weight'])
+                if abs(day_cash - new_cash_file) > TOL:
+                    post.append((d, abs(day_cash - new_cash_file)))
             else:
                 codes = set(day_w.index) | set(exp_w.index)
                 diff = (day_w.reindex(codes).fillna(0) - exp_w.reindex(codes).fillna(0)).abs().max()
@@ -141,7 +154,7 @@ def main() -> bool:
     else:
         print('  非调仓日漂移全部满足。')
     if drift_old:
-        fail(f'调仓日 old 不符: {len(drift_old)} 天')
+        fail(f'调仓日 old 不符: {len(drift_old)} 天，示例 {drift_old[:3]}')
     else:
         print('  调仓日 old_weights/old_cash 一致。')
     if post:
@@ -149,7 +162,7 @@ def main() -> bool:
     else:
         print('  调仓后 daily_weights/cash 与 new 一致。')
 
-    # [D] 换手 / 成本
+    # [D] 换手 / 成本（含空仓分支）
     print('\n[D] 换手 / 成本复算')
     t_fail, c_fail = [], []
     for _, r in rb.iterrows():
@@ -177,6 +190,7 @@ def main() -> bool:
         fail(f'cost 复算不符: {len(c_fail)} 次，示例 {c_fail[:3]}')
     else:
         print('  cost 复算一致（只含证券，基数换算到上日净资产）。')
+
     merged = acct.join(rb.set_index('trade_date')[['turnover', 'cost']],
                        how='inner', rsuffix='_rb')
     if (merged['turnover'] - merged['turnover_rb']).abs().max() > TOL:
@@ -208,7 +222,7 @@ def main() -> bool:
     # [E] 选仓约束
     print('\n[E] 选仓约束检查')
     bad = diag[(diag['n_selected'] > 5) |
-               (diag.get('non_broad_n', pd.Series(0, index=diag.index)) > 2) |
+               (diag['non_broad_n'] > 2) |
                ((diag['broad_n'] < 3) & (diag['n_selected'] > diag['broad_n'] + 2))]
     if not bad.empty:
         fail(f'选仓约束失效: {len(bad)} 次，示例 '

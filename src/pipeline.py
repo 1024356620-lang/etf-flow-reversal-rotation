@@ -35,8 +35,7 @@ def _monthly_pools(universe, factor_df, config):
             pool = cross[cross['flow_cum'] <= 0]
         else:  # percentile
             pool = cross[cross['flow_pct'] <= 0.5]
-        if len(pool) < config.top_n:
-            pool = cross
+        # 去掉 fallback：候选不足时保留 pool 原样，由 selector 按 n/top_n 降仓
         pools[date] = pool
     return pools
 

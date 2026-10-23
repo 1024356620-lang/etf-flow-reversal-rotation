@@ -14,6 +14,11 @@
   - cost = (1 + market_ret) * fee_fraction，换算成占上日净资产
   - net_ret = market_ret - cost，三者同基数（相对上日净资产）
   - turnover 含现金，仅用于统计资产配置变化
+
+空仓分支：
+  - old_weights 写换仓前漂移权重，new_weights 为空
+  - turnover 含现金，sum(|new-old|)/2，与非空仓分支一致
+  - traded_fraction 只含证券，cost 只按证券计费
 """
 from typing import Dict, List
 
@@ -104,19 +109,37 @@ def run_backtest(holdings_by_date: Dict[pd.Timestamp, List[str]],
                 # 空仓：清掉全部证券，现金 100%
                 if len(drifted) > 0:
                     traded_fraction = float(drifted.abs().sum())
-                    turnover = traded_fraction / 2.0
+                    old_full = pd.concat([drifted, pd.Series({'__cash__': cash_drifted})])
+                    new_full = pd.Series({'__cash__': 1.0})
+                    all_codes = old_full.index.union(new_full.index)
+                    turnover = float(
+                        (new_full.reindex(all_codes).fillna(0) -
+                         old_full.reindex(all_codes).fillna(0)).abs().sum() / 2.0
+                    )
                     fee_fraction = traded_fraction * cost_rate
                     cost = (1.0 + market_ret) * fee_fraction
+                else:
+                    traded_fraction = 0.0
+                    turnover = 0.0
+                    fee_fraction = 0.0
+                    cost = 0.0
+
+                rebalance_rows.append({
+                    'trade_date': date,
+                    'old_holdings': ','.join(drifted.index),
+                    'new_holdings': '',
+                    'old_weights': ','.join(
+                        f'{c}:{drifted.get(c, 0):.17g}' for c in drifted.index),
+                    'new_weights': '',
+                    'old_cash_weight': cash_drifted,
+                    'new_cash_weight': 1.0,
+                    'turnover': turnover,
+                    'traded_fraction': traded_fraction,
+                    'fee_fraction': fee_fraction,
+                    'cost': cost,
+                })
                 weights = pd.Series(dtype=float)
                 cash_weight = 1.0
-                rebalance_rows.append({
-                    'trade_date': date, 'old_holdings': ','.join(drifted.index),
-                    'new_holdings': '', 'old_weights': '',
-                    'new_weights': '', 'old_cash_weight': cash_drifted,
-                    'new_cash_weight': 1.0, 'turnover': turnover,
-                    'traded_fraction': traded_fraction,
-                    'fee_fraction': fee_fraction, 'cost': cost,
-                })
 
         else:
             if len(weights) > 0:

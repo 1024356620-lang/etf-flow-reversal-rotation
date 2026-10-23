@@ -2,23 +2,15 @@
 """选股规则。宽基约束：预留 min_broad_n 个宽基仓位，缺额保留现金，不以其他指数补足。
 
 规则：
-  1. 按资金流分位从低到高排序，优先满足 min_broad_n 个宽基。
+  1. 按 flow_pct 从低到高排序，优先满足 min_broad_n 个宽基。
   2. 宽基足够时补到 top_n；宽基不足时非宽基最多补 2 个。
-  3. 缺额仓位由回测引擎按现金处理：gross = n_selected / top_n。
+  3. 候选不足时（len(pool) < top_n），只从 pool 里选，不足的仓位由回测引擎按现金处理。
   4. 断言：n_selected <= top_n，non_broad_n <= 2，宽基不足时 n_selected <= broad_n + 2。
 """
 from typing import Dict, List, Tuple
 
 import pandas as pd
-import sys
-from pathlib import Path
 
-SRC = Path(__file__).resolve().parent
-ROOT = SRC.parent
-for p in (str(ROOT), str(SRC)):
-    if p not in sys.path:
-        sys.path.insert(0, p)
-        
 from config import (
     StrategyConfig, BROAD_BASE_CODES, BROAD_DEDUP, SECTOR_KEYWORDS,
 )
@@ -46,6 +38,24 @@ def select_holdings(pool: pd.DataFrame,
                     config: StrategyConfig,
                     name_map: Dict[str, str],
                     sort_col: str = 'flow_pct') -> Tuple[List[str], Dict]:
+    """返回 (holdings, diagnostics)。
+
+    holdings 长度可能 < top_n：宽基不足或候选不足时缺额保留现金，
+    由 backtest 按 gross = len(holdings)/top_n 处理。
+    """
+    if pool is None or len(pool) == 0:
+        return [], {
+            'n_selected': 0,
+            'broad_n': 0,
+            'non_broad_n': 0,
+            'broad_ok': False,
+            'fallback': 'empty_pool',
+            'cash_slots': config.top_n,
+            'cash_weight_implied': 1.0,
+            'broad_shortfall_reason': 'empty_pool',
+            'candidate_shortfall': True,
+        }
+
     pool = pool.sort_values(sort_col)
     all_codes = pool['index_code'].tolist()
     is_broad = {c: _is_broad(c, name_map.get(c, '')) for c in all_codes}
@@ -75,7 +85,7 @@ def select_holdings(pool: pd.DataFrame,
             break
         try_add(c)
 
-    # 2) 补齐
+    # 2) 补齐：宽基足够补到 top_n（受候选数限制）；宽基不足时非宽基最多补 2 个
     if broad_n >= config.min_broad_n:
         for c in all_codes:
             if len(selected) >= config.top_n:
@@ -117,5 +127,8 @@ def select_holdings(pool: pd.DataFrame,
             None if broad_n >= config.min_broad_n
             else ('no_broad_candidates' if broad_n == 0 else 'insufficient_broad')
         ),
+        # 候选不足：宽基已够但 pool 里没有足够标的，导致 n_selected < top_n
+        'candidate_shortfall': (len(selected) < config.top_n and
+                                broad_n >= config.min_broad_n),
     }
     return selected, diagnostics
