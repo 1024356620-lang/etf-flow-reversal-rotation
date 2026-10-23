@@ -52,7 +52,7 @@
 
 **冻结记录**：
 
-- 代码提交：`<填入 git rev-parse HEAD 输出>`
+- 代码提交：`baa7cced83f94c05c71b64cdddf82a3ee2e0e830`（冻结结果的代码提交；当前 HEAD 是它的 docs 子提交，仅修改 README）
 - 配置：`flow_filter_mode='absolute'`，`min_etf_size=5e8`，`top_n=5`，`cost_rate=0.001`，选仓 `sort_col='flow_pct'`，无 fallback
 - 数据版本：CSMAR 数据快照，拉取日期 2026-10-19
 - 运行日期：2026-10-24
