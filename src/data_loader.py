@@ -45,12 +45,15 @@ def _clean_index_code(s: str) -> str:
 
 
 def _load_trading_calendar(index_daily: pd.DataFrame) -> pd.DatetimeIndex:
-    """以沪深300或上证指数行情日期作为权威交易日历。"""
+    """以沪深300、上证指数或中证全指的行情日期作为交易日历。
+    三个参考指数都缺失时抛错，要求显式提供日历，不静默退回全体指数日期。"""
     for code in ('000300', '000001', '000985'):
         sub = index_daily[index_daily['index_code'] == code]
         if len(sub) > 0:
             return pd.DatetimeIndex(sorted(sub['trade_date'].unique()))
-    return pd.DatetimeIndex(sorted(index_daily['trade_date'].unique()))
+    raise ValueError(
+        '无法从 000300 / 000001 / 000985 推导交易日历。'
+        '请在 raw_data 中提供至少一个参考指数的完整行情，或显式传入交易日历。')
 
 
 def load_real_data(config: StrategyConfig) -> MarketData:
