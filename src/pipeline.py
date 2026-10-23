@@ -60,7 +60,12 @@ def _export_holdings_returns(account, daily_weights, full_returns, out_dir):
     print(f'  holdings_returns 已保存: {out_dir / "holdings_returns.csv"}')
 
 
-def run_with_data(config: StrategyConfig, data) -> dict:
+def run_with_data(config: StrategyConfig, data, out_dir=None) -> dict:
+    """用已加载的 MarketData 跑完整流程。
+
+    out_dir: 输出目录。None 时默认写 BASE_DIR/results；测试应传 tmp_path，
+    避免覆盖真实冻结账本。
+    """
     print('\n[因子] 计算资金流因子...')
     index_flow = compute_index_flow(data.etf_daily, data.mapping)
     factor_df = compute_flow_factor(index_flow, data.trading_calendar,
@@ -85,7 +90,7 @@ def run_with_data(config: StrategyConfig, data) -> dict:
         diag['trade_date'] = date
         diag['pool_size_before_fallback'] = len(pool)
         diagnostics.append(diag)
-    print(f'  约束未满足月份数: '
+    print(f'  宽基不足、按规则留现金的调仓次数: '
           f'{sum(1 for d in diagnostics if not d["broad_ok"])}')
 
     print('[回测] 运行回测引擎...')
@@ -99,8 +104,8 @@ def run_with_data(config: StrategyConfig, data) -> dict:
     yearly = yearly_performance(account['net_ret'])
 
     # ---------- 落盘 ----------
-    out_dir = Path(BASE_DIR) / 'results'
-    out_dir.mkdir(exist_ok=True)
+    out_dir = Path(out_dir) if out_dir is not None else Path(BASE_DIR) / 'results'
+    out_dir.mkdir(exist_ok=True, parents=True)
 
     account.to_csv(out_dir / 'account.csv')
     daily_weights.to_csv(out_dir / 'daily_weights.csv', index=False)

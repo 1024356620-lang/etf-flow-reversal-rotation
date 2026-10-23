@@ -5,11 +5,11 @@ from src.pipeline import run_with_data
 from tests.synthetic import make_market_data
 
 
-def test_pipeline_runs_end_to_end():
+def test_pipeline_runs_end_to_end(tmp_path):
     data = make_market_data(n_days=250, n_codes=5)
     config = StrategyConfig(start_date='2023-01-01', end_date='2023-12-31',
                             flow_filter_mode='absolute')
-    result = run_with_data(config, data)
+    result = run_with_data(config, data, out_dir=tmp_path)
 
     # 账户记录非空，且每日一行
     acct = result['account']

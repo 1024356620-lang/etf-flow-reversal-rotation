@@ -10,7 +10,15 @@
 from typing import Dict, List, Tuple
 
 import pandas as pd
+import sys
+from pathlib import Path
 
+SRC = Path(__file__).resolve().parent
+ROOT = SRC.parent
+for p in (str(ROOT), str(SRC)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+        
 from config import (
     StrategyConfig, BROAD_BASE_CODES, BROAD_DEDUP, SECTOR_KEYWORDS,
 )
@@ -37,7 +45,7 @@ def _is_broad(code: str, name: str) -> bool:
 def select_holdings(pool: pd.DataFrame,
                     config: StrategyConfig,
                     name_map: Dict[str, str],
-                    sort_col: str = 'flow_cum_std') -> Tuple[List[str], Dict]:
+                    sort_col: str = 'flow_pct') -> Tuple[List[str], Dict]:
     pool = pool.sort_values(sort_col)
     all_codes = pool['index_code'].tolist()
     is_broad = {c: _is_broad(c, name_map.get(c, '')) for c in all_codes}
