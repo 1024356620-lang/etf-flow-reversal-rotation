@@ -9,7 +9,7 @@ flow_filter_mode：
 
 signal_lag：
   - 't0' 用 T 日数据，T 日收盘调仓
-  - 't1' 用截至 T-1 日的数据，T 日收盘调仓（严格匹配上一交易日）
+  - 't1' 用截至 T-1 日的数据，T 日收盘调仓（保守版）
 """
 import sys
 from dataclasses import replace
@@ -53,17 +53,15 @@ def _apply_signal_lag(factor_df, config, trading_calendar):
     
     df = df.merge(sig, on=['signal_date', 'index_code'], how='left')
 
-    # 强制今天的 flow_cum 必须等于昨天的 flow_cum_raw
+    # 强制今天的 flow_cum 必须等于昨天的 flow_cum_raw，保留 NaN 以便剔除
     df['flow_cum'] = df['flow_cum_sig']
     
-    # 【关键修复】这里绝对不能 dropna！
-    # 保留全量数据，缺少前日数据的行，flow_cum 就是 NaN。
-    
-    # 直接在包含 NaN 的面板上重算 flow_pct（pandas 的 rank 默认排除 NaN，不会影响排名基数）
+    # 在当日全量截面上重新排名（pandas 的 rank 默认排除 NaN）
     df['flow_pct'] = df.groupby('trade_date')['flow_cum'].rank(pct=True)
 
     return df[['index_code', 'trade_date', 'signal_date', 'flow_cum', 
                'flow_cum_raw', 'flow_pct', 'valid_obs']]
+
 
 def _signal_date(date, trading_calendar, config):
     """t1 时返回 date 的前一个交易日；t0 时返回 date。"""
@@ -179,7 +177,7 @@ def _export_holdings_returns(account, daily_weights, full_returns, out_dir):
         day_w = daily_weights[daily_weights['trade_date'] == d]
         prev_w = (day_w.set_index('index_code')['weight']
                   if len(day_w) > 0 else pd.Series(dtype=float))
-    pd.DataFrame(rows).to_csv(out_dir / 'holdings_returns.csv', index=False, float_format='%.17g')
+    pd.DataFrame(rows).to_csv(out_dir / 'holdings_returns.csv', index=False)
     print(f'  holdings_returns 已保存: {out_dir / "holdings_returns.csv"}')
 
 
@@ -195,7 +193,7 @@ def run_with_data(config: StrategyConfig, data, out_dir=None) -> dict:
     factor_df = _apply_signal_lag(factor_df, config, data.trading_calendar)
     print(f'  信号时点: {config.signal_lag}')
 
-    # 全交易日 × 指数的因子面板
+    # 全交易日 × 指数的因子面板，供 verify_signal_lag.py 核验
     factor_df[['index_code', 'trade_date', 'flow_cum', 'flow_cum_raw', 'flow_pct']] \
         .to_csv(out_dir / 'factor_panel.csv', index=False, float_format='%.17g')
     print(f'  factor_panel 已保存: {out_dir / "factor_panel.csv"}')
@@ -203,10 +201,13 @@ def run_with_data(config: StrategyConfig, data, out_dir=None) -> dict:
     print('[样本池] 构建选股池...')
     universe = build_universe(index_flow, data.index_daily, data.inst_ratio,
                               data.mapping, data.index_name, config)
+    
+    # 构造价格面板，供回测引擎进行缺失收益的估值
     price_panel = data.index_daily.pivot_table(
         index='trade_date', columns='index_code', values='close')
     price_panel.index.name = 'trade_date'
     price_panel.columns.name = 'index_code'
+    
     print(f'  日均指数数: '
           f'{universe.groupby("trade_date")["index_code"].nunique().mean():.1f}')
 
@@ -245,7 +246,9 @@ def run_with_data(config: StrategyConfig, data, out_dir=None) -> dict:
 
     print('[回测] 运行回测引擎...')
     strict = config.flow_filter_mode != 'c_equal_weight'
-    account, daily_weights, cash_weights, rebalance_detail, missing_df = run_backtest(
+    
+    # 接收 6 个返回值（增加了 actual_ret_df）
+    account, daily_weights, cash_weights, rebalance_detail, missing_df, actual_ret_df = run_backtest(
         holdings_by_date, data.full_returns, data.trading_calendar,
         config.cost_rate, top_n=config.top_n,
         gross_override=gross_override,
@@ -258,10 +261,10 @@ def run_with_data(config: StrategyConfig, data, out_dir=None) -> dict:
     perf = evaluate(account['net_ret'], bench, config.risk_free_rate)
     yearly = yearly_performance(account['net_ret'])
 
-    account.to_csv(out_dir / 'account.csv', float_format='%.17g')
-    daily_weights.to_csv(out_dir / 'daily_weights.csv', index=False, float_format='%.17g')
-    cash_weights.to_csv(out_dir / 'cash_weights.csv', index=False, float_format='%.17g')
-    rebalance_detail.to_csv(out_dir / 'rebalance_detail.csv', index=False, float_format='%.17g')
+    account.to_csv(out_dir / 'account.csv')
+    daily_weights.to_csv(out_dir / 'daily_weights.csv', index=False)
+    cash_weights.to_csv(out_dir / 'cash_weights.csv', index=False)
+    rebalance_detail.to_csv(out_dir / 'rebalance_detail.csv', index=False)
 
     pd.DataFrame([
         {'trade_date': d, 'holdings': ','.join(h)}
@@ -276,9 +279,14 @@ def run_with_data(config: StrategyConfig, data, out_dir=None) -> dict:
     stacked.columns = ['trade_date', 'index_code', 'index_ret']
     stacked.to_csv(out_dir / 'index_returns.csv', index=False, float_format='%.17g')
 
-    if missing_df is not None:
+    if not missing_df.empty:
         missing_df.to_csv(out_dir / 'missing_returns.csv', index=False)
         print(f'  missing_returns 已保存: {out_dir / "missing_returns.csv"}（{len(missing_df)} 条）')
+
+    # 保存审计追踪：实际记账的每日资产收益
+    if not actual_ret_df.empty:
+        actual_ret_df.to_csv(out_dir / 'actual_returns.csv', index=False, float_format='%.17g')
+        print(f'  actual_returns 已保存: {out_dir / "actual_returns.csv"}')
 
     _export_signal_panel(pools, holdings_by_date, out_dir)
     _export_holdings_returns(account, daily_weights, data.full_returns, out_dir)

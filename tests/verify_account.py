@@ -21,6 +21,7 @@
 """
 import numpy as np
 import pandas as pd
+import argparse
 from pathlib import Path
 
 RESULTS = Path(__file__).resolve().parents[1] / 'results'
@@ -39,6 +40,14 @@ def _parse_weights(s) -> dict:
 
 
 def main() -> bool:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--results-dir', default='results', help='账本所在目录')
+    args = parser.parse_args()
+
+    RESULTS = Path(args.results_dir)
+    if not RESULTS.exists():
+        print(f'目录不存在: {RESULTS}')
+        return False
     failures = []
 
     acct = pd.read_csv(RESULTS / 'account.csv', parse_dates=['trade_date']).set_index('trade_date')
