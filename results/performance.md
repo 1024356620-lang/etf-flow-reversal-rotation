@@ -1,4 +1,4 @@
-# 策略绩效（冻结版，去掉 fallback）
+# 策略绩效
 
 - 配置：`flow_filter_mode='absolute'`，`min_etf_size=5e8`，`top_n=5`，`cost_rate=0.001`，`sort_col='flow_pct'`，无 fallback
 - 数据：CSMAR 快照 2026-10-19
