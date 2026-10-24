@@ -283,11 +283,11 @@ def run_with_data(config: StrategyConfig, data, out_dir=None) -> dict:
         missing_df.to_csv(out_dir / 'missing_returns.csv', index=False)
         print(f'  missing_returns 已保存: {out_dir / "missing_returns.csv"}（{len(missing_df)} 条）')
 
+
     # 保存审计追踪：实际记账的每日资产收益
     if not actual_ret_df.empty:
         actual_ret_df.to_csv(out_dir / 'actual_returns.csv', index=False, float_format='%.17g')
-        print(f'  actual_returns 已保存: {out_dir / "actual_returns.csv"}')
-
+        print(f'  actual_returns 已保存: {out_dir / "actual_returns.csv"}（{len(actual_ret_df)} 条）')
     _export_signal_panel(pools, holdings_by_date, out_dir)
     _export_holdings_returns(account, daily_weights, data.full_returns, out_dir)
     print(f'  已保存: {out_dir}')

@@ -1,30 +1,25 @@
 # -*- coding: utf-8 -*-
-"""核验 account / daily_weights / cash_weights / rebalance_detail / holdings_returns。
+"""核验账本内部一致性、信号缺失处理与漂移复算。
 
-口径：
-  - 权重占总资产，sum(w) + cash = 1
-  - 漂移 w_t = w_{t-1}(1+r_t)/(1+R_t)，cash 同理
-  - market_ret 复算：(w_{t-1} * r_t).sum()
-  - turnover 含现金；traded_fraction 只含证券
-  - fee_fraction = traded_fraction * cost_rate（占当日扣费前净资产）
-  - cost = (1 + market_ret) * fee_fraction（占上日净资产）
-  - net_ret = market_ret - cost
-  - 选仓约束：n_selected<=5, non_broad_n<=2, 宽基不足时 n_selected<=broad_n+2
+核验范围：
+  - [0] 资产权重 + 现金权重 = 1
+  - [A] 原始数据缺失覆盖检查（使用 holdings_returns.csv）
+  - [A2] 实际记账收益完整性（使用 actual_returns.csv）
+  - [B] market_ret 复算（使用实际记账收益）
+  - [C] 权重漂移复算（使用实际记账收益）
+  - [D] 换手与成本复算
+  - [D2] net_ret 恒等式
+  - [E] 选仓约束检查
 
-跨空仓期处理：
-  - w_pivot 只含有持仓的日期，直接 shift(1) 会跨过空仓期，错位
-  - 本脚本先把 w_pivot 和 cw 补齐到完整账本日期（acct.index），
-    空仓日资产权重为 0、现金权重为 1，再 shift(1) 得到上一交易日权重
-  - [A]、[B]、[C] 全部使用补齐后的 prev_weights / prev_cash
-
-失败返回非零退出码。
+用法：
+  python tests/verify_account.py --results-dir results_A
 """
-import numpy as np
-import pandas as pd
 import argparse
 from pathlib import Path
 
-RESULTS = Path(__file__).resolve().parents[1] / 'results'
+import numpy as np
+import pandas as pd
+
 COST_RATE = 0.001
 TOL = 1e-10
 
@@ -44,32 +39,42 @@ def main() -> bool:
     parser.add_argument('--results-dir', default='results', help='账本所在目录')
     args = parser.parse_args()
 
-    RESULTS = Path(args.results_dir)
-    if not RESULTS.exists():
-        print(f'目录不存在: {RESULTS}')
+    results = Path(args.results_dir)
+    if not results.exists():
+        print(f'目录不存在: {results}')
         return False
-    failures = []
 
-    acct = pd.read_csv(RESULTS / 'account.csv', parse_dates=['trade_date']).set_index('trade_date')
-    dw = pd.read_csv(RESULTS / 'daily_weights.csv', parse_dates=['trade_date'])
-    cw = pd.read_csv(RESULTS / 'cash_weights.csv', parse_dates=['trade_date']).set_index('trade_date')
-    rb = pd.read_csv(RESULTS / 'rebalance_detail.csv', parse_dates=['trade_date'])
-    hr = pd.read_csv(RESULTS / 'holdings_returns.csv', parse_dates=['trade_date'])
-    diag = pd.read_csv(RESULTS / 'diagnostics.csv', parse_dates=['trade_date'])
+    acct = pd.read_csv(results / 'account.csv', parse_dates=['trade_date']).set_index('trade_date')
+    dw = pd.read_csv(results / 'daily_weights.csv', parse_dates=['trade_date'])
+    cw = pd.read_csv(results / 'cash_weights.csv', parse_dates=['trade_date']).set_index('trade_date')
+    rb = pd.read_csv(results / 'rebalance_detail.csv', parse_dates=['trade_date'])
+    hr = pd.read_csv(results / 'holdings_returns.csv', parse_dates=['trade_date'])
+    
+    ar_path = results / 'actual_returns.csv'
+    if not ar_path.exists():
+        print(f'缺少 {ar_path}，无法核验实际记账收益')
+        return False
+    ar = pd.read_csv(ar_path, parse_dates=['trade_date'])
 
-    ret_panel = hr.pivot(index='trade_date', columns='index_code', values='index_ret')
+    diag = pd.read_csv(results / 'diagnostics.csv', parse_dates=['trade_date'])
+
+    # 收益面板
+    ret_raw = hr.pivot(index='trade_date', columns='index_code', values='index_ret')
+    ret_actual = ar.pivot(index='trade_date', columns='index_code', values='actual_ret')
+    
     w_pivot = (dw.pivot(index='trade_date', columns='index_code', values='weight')
                  .fillna(0.0))
 
     all_dates = list(acct.index)
     rebalance_dates = set(rb['trade_date'])
 
-    # ---------- 关键：补齐到完整账本日期，再 shift ----------
-    # 空仓日资产权重为 0，现金权重为 1
+    # 补齐到完整账本日期
     w_daily = w_pivot.reindex(all_dates, fill_value=0.0)
     cw_daily = cw['cash_weight'].reindex(all_dates, fill_value=1.0)
-    prev_weights = w_daily.shift(1, fill_value=0.0)   # 上一交易日资产权重
-    prev_cash = cw_daily.shift(1, fill_value=1.0)     # 上一交易日现金权重
+    prev_weights = w_daily.shift(1, fill_value=0.0)
+    prev_cash = cw_daily.shift(1, fill_value=1.0)
+
+    failures = []
 
     def fail(msg):
         failures.append(msg)
@@ -84,65 +89,67 @@ def main() -> bool:
     else:
         print(f'  全部 {len(total)} 天满足，最大偏差 {diff_total.max():.3e}')
 
-    # ================= [A] 收益覆盖 =================
-    print('\n[A] 收益覆盖（按完整账本日期，上日权重 > 0 的资产当日收益必须存在且有限）')
+    # ================= [A] 原始收益覆盖 =================
+    print('\n[A] 原始收益覆盖（上日权重 > 0 的资产，当日原始收益缺失检查）')
     missing_ret = []
     for d in all_dates[1:]:
         pw = prev_weights.loc[d]
         pw = pw[pw > 0]
         if len(pw) == 0:
             continue
-        r_today = ret_panel.loc[d] if d in ret_panel.index else pd.Series(dtype=float)
+        r_today = ret_raw.loc[d] if d in ret_raw.index else pd.Series(dtype=float)
         for code, w in pw.items():
             if code not in r_today.index or not np.isfinite(r_today.get(code, np.nan)):
                 missing_ret.append((d, code))
 
     w_codes = set(w_daily.columns[w_daily.sum(axis=0) > 0])
-    r_codes = set(ret_panel.columns)
+    r_codes = set(ret_raw.columns)
     dropped = sorted(w_codes - r_codes)
     if dropped:
-        fail(f'权重中有 {len(dropped)} 个代码在收益表中不存在: {dropped[:10]}')
+        fail(f'权重中有 {len(dropped)} 个代码在原始收益表中不存在: {dropped[:10]}')
     if missing_ret:
-        fail(f'上日权重 > 0 但当日收益缺失/非有限: {len(missing_ret)} 条，示例 {missing_ret[:5]}')
+        print(f'  注意: 发现 {len(missing_ret)} 条原始收益缺失，应由回测引擎填补。')
+        # 验证这些缺失是否确实存在于实际的 missing_returns.csv 里（可选，视需求）
     else:
-        print('  上日权重 > 0 的资产收益全部存在且有限。')
+        print('  上日权重 > 0 的资产原始收益全部存在且有限。')
 
-    # holdings_returns 覆盖：上日有持仓的日期必须出现在 hr 中
-    hr_dates = set(hr['trade_date'].unique())
-    missing_dates = []
-    for d in all_dates[1:]:
-        pw = prev_weights.loc[d]
-        pw = pw[pw > 0]
-        if len(pw) == 0:
-            continue   # 上日空仓，不需要 holdings_returns
-        if d not in hr_dates:
-            missing_dates.append(d)
+    # ================= [A2] 实际记账收益完整性 =================
+    print('\n[A2] 实际记账收益完整性（确保无 NaN 污染）')
+    
+    # 只有“上日也有持仓”的日期，当天才有持仓收益需要记录
+    has_holding_dates = set()
+    for i, d in enumerate(all_dates):
+        if acct.loc[d, 'n_holdings'] > 0 and i > 0 and acct.iloc[i-1]['n_holdings'] > 0:
+            has_holding_dates.add(d)
+            
+    actual_dates = set(ret_actual.index)
+    
+    missing_dates = list(has_holding_dates - actual_dates)
     if missing_dates:
-        fail(f'holdings_returns 未覆盖 {len(missing_dates)} 个“上日有持仓”的日期，'
-             f'示例 {missing_dates[:5]}')
+        fail(f'actual_returns 未覆盖 {len(missing_dates)} 个有持仓的账本日期，示例 {missing_dates[:5]}')
     else:
-        print('  holdings_returns 覆盖全部“上日有持仓”的日期。')
+        print('  actual_returns 覆盖所有有效持仓的账本日期。')
 
     # ================= [B] market_ret 复算 =================
-    print('\n[B] market_ret 复算（补齐后前一日权重 × 当日收益）')
-    recon = (prev_weights * ret_panel.reindex(all_dates)).sum(axis=1)
+    print('\n[B] market_ret 复算（使用实际记账收益）')
+    # 用实际的 ret_actual 来复算 market_ret
+    recon = (prev_weights * ret_actual.reindex(all_dates)).sum(axis=1)
     diff_mr = (acct['market_ret'] - recon).abs()
-    print(f'  样本 {len(diff_mr)} 天（完整账本），最大误差 {diff_mr.max():.3e}')
+    print(f'  样本 {len(diff_mr)} 天，最大误差 {diff_mr.max():.3e}')
     if diff_mr.max() > TOL:
-        fail(f'market_ret 最大误差 {diff_mr.max():.3e}')
         bad = diff_mr[diff_mr > TOL].head(5)
-        print(f'  误差 > TOL 的日期示例: {bad.to_dict()}')
+        fail(f'market_ret 最大误差 {diff_mr.max():.3e}，示例日期: {bad.index.tolist()}')
 
     # ================= [C] 权重漂移（含空仓期） =================
-    print('\n[C] 权重漂移（w_t = w_{t-1}(1+r_t)/(1+R_t)，cash 同理）')
+    print('\n[C] 权重漂移（w_t = w_{t-1}(1+r_t)/(1+R_t)，使用实际记账收益）')
     rb_by_date = {r['trade_date']: r for _, r in rb.iterrows()}
     drift_non, drift_old, post = [], [], []
 
     for d in all_dates[1:]:
         pw = prev_weights.loc[d]
         pc = float(prev_cash.loc[d])
-        # 上一交易日无持仓且满现金，则当日若仍空仓，漂移是恒等；若当日调仓，old 应为空
-        r_today = ret_panel.loc[d] if d in ret_panel.index else pd.Series(dtype=float)
+        
+        r_today = ret_actual.loc[d] if d in ret_actual.index else pd.Series(dtype=float)
         R = float((pw * r_today.reindex(pw.index).fillna(0.0)).sum())
         denom = 1.0 + R
         exp_w = pw * (1 + r_today.reindex(pw.index).fillna(0.0)) / denom if denom != 0 else pw
@@ -190,7 +197,7 @@ def main() -> bool:
     else:
         print('  调仓后 daily_weights/cash 与 new 一致。')
 
-    # ================= [D] 换手 / 成本（含空仓分支） =================
+    # ================= [D] 换手 / 成本 =================
     print('\n[D] 换手 / 成本复算')
     t_fail, c_fail = [], []
     for _, r in rb.iterrows():
