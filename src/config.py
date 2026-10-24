@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """全局参数与常量。所有模块只从这里 import，不自行定义默认值。"""
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import FrozenSet, Dict, List
 import os
 
@@ -33,7 +33,7 @@ SECTOR_KEYWORDS: Dict[str, List[str]] = {
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    """策略配置。flow_filter_mode 用于区分'原规则复现版'与'扩展研究版'。"""
+    """策略配置。flow_filter_mode 用于区分复现版、实验 B、实验 C。"""
     start_date: str = '2019-01-01'
     end_date: str = '2026-01-31'
     rebalance_freq: str = 'M'
@@ -46,12 +46,18 @@ class StrategyConfig:
     max_inst_ratio: float = 0.70
     inst_lag_months: int = 2
 
-    cost_rate: float = 0.001          # 单边费率；双边成本由引擎按换手计算
+    cost_rate: float = 0.001
     min_broad_n: int = 3
     max_per_sector: int = 99
 
-    # 'absolute' = 研报原规则 flow_cum <= 0（复现版）
-    # 'percentile' = 截面分位 flow_pct <= 0.5（改进版，需单独披露 fallback）
+    # 'absolute'       = flow_cum <= 0（复现版 A）
+    # 'relative'       = 不设阈值，按 flow_pct 排序（实验 B）
+    # 'percentile'     = flow_pct <= 0.5（旧改进版）
+    # 'c_equal_weight' = 用 A 的总仓位，等权持有全部合格候选（实验 C）
     flow_filter_mode: str = 'absolute'
 
-    risk_free_rate: float = 0.0       # 夏普计算用，年化
+    # 't0' = 用 T 日数据，T 日收盘调仓（当前基线，可能含前视）
+    # 't1' = 用截至 T-1 日的数据，T 日收盘调仓（保守版）
+    signal_lag: str = 't0'
+
+    risk_free_rate: float = 0.0

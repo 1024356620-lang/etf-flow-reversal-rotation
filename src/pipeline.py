@@ -1,6 +1,18 @@
 # -*- coding: utf-8 -*-
-"""编排：数据 -> 因子 -> 样本池 -> 选股 -> 回测 -> 绩效 -> 落盘。"""
+"""编排：数据 -> 因子 -> 信号时点 -> 样本池 -> 选股 -> 回测 -> 绩效 -> 落盘。
+
+flow_filter_mode：
+  - 'absolute'       复现版 A：flow_cum <= 0，缺额现金
+  - 'relative'       实验 B：不设阈值，按 flow_pct 排序，缺额现金
+  - 'percentile'     旧改进版：flow_pct <= 0.5
+  - 'c_equal_weight' 实验 C：用 A 的总仓位，等权持有全部可交易合格候选
+
+signal_lag：
+  - 't0' 用 T 日数据，T 日收盘调仓
+  - 't1' 用截至 T-1 日的数据，T 日收盘调仓（严格匹配上一交易日）
+"""
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parent
@@ -21,28 +33,139 @@ from backtest import run_backtest
 from performance import evaluate, yearly_performance
 
 
+def _apply_signal_lag(factor_df, config, trading_calendar):
+    df = factor_df.copy()
+    df['flow_cum_raw'] = df['flow_cum']
+
+    if config.signal_lag == 't0':
+        df['signal_date'] = df['trade_date']
+        return df[['index_code', 'trade_date', 'signal_date', 'flow_cum', 
+                   'flow_cum_raw', 'flow_pct', 'valid_obs']]
+
+    cal = pd.DatetimeIndex(sorted(trading_calendar))
+    cal_df = pd.DataFrame({'trade_date': cal})
+    cal_df['signal_date'] = cal_df['trade_date'].shift(1)
+    prev_map = dict(zip(cal_df['trade_date'], cal_df['signal_date']))
+    df['signal_date'] = df['trade_date'].map(prev_map)
+
+    sig = df[['trade_date', 'index_code', 'flow_cum_raw']].rename(
+        columns={'trade_date': 'signal_date', 'flow_cum_raw': 'flow_cum_sig'})
+    
+    df = df.merge(sig, on=['signal_date', 'index_code'], how='left')
+
+    # 强制今天的 flow_cum 必须等于昨天的 flow_cum_raw
+    df['flow_cum'] = df['flow_cum_sig']
+    
+    # 【关键修复】这里绝对不能 dropna！
+    # 保留全量数据，缺少前日数据的行，flow_cum 就是 NaN。
+    
+    # 直接在包含 NaN 的面板上重算 flow_pct（pandas 的 rank 默认排除 NaN，不会影响排名基数）
+    df['flow_pct'] = df.groupby('trade_date')['flow_cum'].rank(pct=True)
+
+    return df[['index_code', 'trade_date', 'signal_date', 'flow_cum', 
+               'flow_cum_raw', 'flow_pct', 'valid_obs']]
+
+def _signal_date(date, trading_calendar, config):
+    """t1 时返回 date 的前一个交易日；t0 时返回 date。"""
+    if config.signal_lag == 't0':
+        return date
+    prev = [d for d in trading_calendar if d < date]
+    return prev[-1] if prev else pd.NaT
+
+
 def _monthly_pools(universe, factor_df, config, trading_calendar):
     cal = pd.DataFrame({'trade_date': pd.DatetimeIndex(sorted(trading_calendar))})
     cal['period'] = cal['trade_date'].dt.to_period(config.rebalance_freq)
     first_dates = cal.groupby('period')['trade_date'].min()
 
     df = universe.merge(
-        factor_df[['index_code', 'trade_date', 'flow_cum', 'flow_pct']],
+        factor_df[['index_code', 'trade_date', 'flow_cum', 'flow_cum_raw', 'flow_pct']],
         on=['index_code', 'trade_date'], how='left').dropna(subset=['flow_cum'])
 
     pools = {}
     for period, date in first_dates.items():
         cross = df[df['trade_date'] == date].copy()
+        cross['signal_date'] = _signal_date(date, trading_calendar, config)
         if config.flow_filter_mode == 'absolute':
             pool = cross[cross['flow_cum'] <= 0]
-        else:
+        elif config.flow_filter_mode == 'relative':
+            pool = cross
+        elif config.flow_filter_mode == 'percentile':
             pool = cross[cross['flow_pct'] <= 0.5]
+        else:  # c_equal_weight 也用全体合格候选
+            pool = cross
         pools[date] = pool
     return pools
 
 
+def _c_holdings(pools_relative, pools_absolute, config, name_map, full_returns,
+                min_history=20, min_valid_ratio=0.8):
+    """实验 C：用 A 的总仓位，等权持有全部可交易合格候选。"""
+    holdings_by_date, gross_override = {}, {}
+    valid = full_returns.notna().astype(float)
+    valid_ratio = valid.rolling(min_history, min_periods=1).mean()
+
+    for date in pools_relative:
+        pool_rel = pools_relative[date]
+        pool_abs = pools_absolute.get(date, pd.DataFrame())
+        a_holdings, _ = select_holdings(pool_abs, config, name_map, sort_col='flow_pct')
+        n_a = len(a_holdings)
+
+        if len(pool_rel) == 0:
+            holdings_by_date[date] = []
+            gross_override[date] = 0.0
+            continue
+
+        if date in full_returns.index:
+            today_valid = set(full_returns.loc[date].dropna().index.astype(str))
+        else:
+            today_valid = set()
+
+        if date in valid_ratio.index:
+            ratio_today = valid_ratio.loc[date]
+            enough_history = set(ratio_today[ratio_today >= min_valid_ratio]
+                                 .index.astype(str))
+        else:
+            enough_history = set()
+
+        candidates = []
+        for c in pool_rel.sort_values('flow_pct')['index_code']:
+            c = str(c)
+            if c not in today_valid:
+                continue
+            if c not in enough_history:
+                continue
+            candidates.append(c)
+
+        if len(candidates) == 0:
+            holdings_by_date[date] = []
+            gross_override[date] = 0.0
+            continue
+
+        holdings_by_date[date] = candidates
+        gross_override[date] = min(n_a / config.top_n, 1.0)
+    return holdings_by_date, gross_override
+
+
+def _export_signal_panel(pools, holdings_by_date, out_dir):
+    rows = []
+    for date, pool in pools.items():
+        selected = set(holdings_by_date.get(date, []))
+        for _, r in pool.iterrows():
+            rows.append({
+                'trade_date': date,
+                'signal_date': r.get('signal_date', pd.NaT),
+                'index_code': r['index_code'],
+                'flow_cum': r['flow_cum'],
+                'flow_cum_raw': r.get('flow_cum_raw', np.nan),
+                'flow_pct': r['flow_pct'],
+                'selected': r['index_code'] in selected,
+            })
+    pd.DataFrame(rows).to_csv(out_dir / 'signal_panel.csv', index=False, float_format='%.17g')
+    print(f'  signal_panel 已保存: {out_dir / "signal_panel.csv"}')
+
+
 def _export_holdings_returns(account, daily_weights, full_returns, out_dir):
-    """导出“上日实际持仓 × 当日”收益，缺失保留 NaN。"""
     rows = []
     prev_w = None
     for d in sorted(account.index):
@@ -56,25 +179,34 @@ def _export_holdings_returns(account, daily_weights, full_returns, out_dir):
         day_w = daily_weights[daily_weights['trade_date'] == d]
         prev_w = (day_w.set_index('index_code')['weight']
                   if len(day_w) > 0 else pd.Series(dtype=float))
-    pd.DataFrame(rows).to_csv(out_dir / 'holdings_returns.csv', index=False)
+    pd.DataFrame(rows).to_csv(out_dir / 'holdings_returns.csv', index=False, float_format='%.17g')
     print(f'  holdings_returns 已保存: {out_dir / "holdings_returns.csv"}')
 
 
 def run_with_data(config: StrategyConfig, data, out_dir=None) -> dict:
-    """用已加载的 MarketData 跑完整流程。
+    out_dir = Path(out_dir) if out_dir is not None else Path(BASE_DIR) / 'results'
+    out_dir.mkdir(exist_ok=True, parents=True)
 
-    out_dir: 输出目录。None 时默认写 BASE_DIR/results；测试应传 tmp_path，
-    避免覆盖真实冻结账本。
-    """
     print('\n[因子] 计算资金流因子...')
     index_flow = compute_index_flow(data.etf_daily, data.mapping)
     factor_df = compute_flow_factor(index_flow, data.trading_calendar,
                                     config.factor_window,
                                     config.factor_min_periods)
+    factor_df = _apply_signal_lag(factor_df, config, data.trading_calendar)
+    print(f'  信号时点: {config.signal_lag}')
+
+    # 全交易日 × 指数的因子面板
+    factor_df[['index_code', 'trade_date', 'flow_cum', 'flow_cum_raw', 'flow_pct']] \
+        .to_csv(out_dir / 'factor_panel.csv', index=False, float_format='%.17g')
+    print(f'  factor_panel 已保存: {out_dir / "factor_panel.csv"}')
 
     print('[样本池] 构建选股池...')
     universe = build_universe(index_flow, data.index_daily, data.inst_ratio,
                               data.mapping, data.index_name, config)
+    price_panel = data.index_daily.pivot_table(
+        index='trade_date', columns='index_code', values='close')
+    price_panel.index.name = 'trade_date'
+    price_panel.columns.name = 'index_code'
     print(f'  日均指数数: '
           f'{universe.groupby("trade_date")["index_code"].nunique().mean():.1f}')
 
@@ -82,35 +214,54 @@ def run_with_data(config: StrategyConfig, data, out_dir=None) -> dict:
     name_map = dict(zip(data.index_name['index_code'],
                         data.index_name['index_name']))
     pools = _monthly_pools(universe, factor_df, config, data.trading_calendar)
-    holdings_by_date, diagnostics = {}, []
-    for date, pool in pools.items():
-        holdings, diag = select_holdings(pool, config, name_map,
-                                         sort_col='flow_pct')
-        holdings_by_date[date] = holdings
-        diag['trade_date'] = date
-        diag['pool_size_before_fallback'] = len(pool)
-        diagnostics.append(diag)
+
+    diagnostics = []
+    gross_override = None
+
+    if config.flow_filter_mode == 'c_equal_weight':
+        config_abs = replace(config, flow_filter_mode='absolute')
+        pools_absolute = _monthly_pools(universe, factor_df, config_abs,
+                                        data.trading_calendar)
+        holdings_by_date, gross_override = _c_holdings(
+            pools, pools_absolute, config, name_map, data.full_returns)
+        for date, pool in pools.items():
+            _, diag = select_holdings(pool, config, name_map, sort_col='flow_pct')
+            diag['trade_date'] = date
+            diag['pool_size_before_fallback'] = len(pool)
+            diag['n_selected_c'] = len(holdings_by_date[date])
+            diagnostics.append(diag)
+    else:
+        holdings_by_date = {}
+        for date, pool in pools.items():
+            holdings, diag = select_holdings(pool, config, name_map,
+                                             sort_col='flow_pct')
+            holdings_by_date[date] = holdings
+            diag['trade_date'] = date
+            diag['pool_size_before_fallback'] = len(pool)
+            diagnostics.append(diag)
+
     print(f'  宽基不足、按规则留现金的调仓次数: '
           f'{sum(1 for d in diagnostics if not d["broad_ok"])}')
 
     print('[回测] 运行回测引擎...')
-    account, daily_weights, cash_weights, rebalance_detail = run_backtest(
+    strict = config.flow_filter_mode != 'c_equal_weight'
+    account, daily_weights, cash_weights, rebalance_detail, missing_df = run_backtest(
         holdings_by_date, data.full_returns, data.trading_calendar,
-        config.cost_rate, top_n=config.top_n, return_details=True)
+        config.cost_rate, top_n=config.top_n,
+        gross_override=gross_override,
+        strict_missing=strict,
+        price_panel=price_panel,
+        return_details=True)
 
     print('[绩效] 评估...')
     bench = data.benchmark.set_index('trade_date')['index_ret']
     perf = evaluate(account['net_ret'], bench, config.risk_free_rate)
     yearly = yearly_performance(account['net_ret'])
 
-    # ---------- 落盘 ----------
-    out_dir = Path(out_dir) if out_dir is not None else Path(BASE_DIR) / 'results'
-    out_dir.mkdir(exist_ok=True, parents=True)
-
-    account.to_csv(out_dir / 'account.csv')
-    daily_weights.to_csv(out_dir / 'daily_weights.csv', index=False)
-    cash_weights.to_csv(out_dir / 'cash_weights.csv', index=False)
-    rebalance_detail.to_csv(out_dir / 'rebalance_detail.csv', index=False)
+    account.to_csv(out_dir / 'account.csv', float_format='%.17g')
+    daily_weights.to_csv(out_dir / 'daily_weights.csv', index=False, float_format='%.17g')
+    cash_weights.to_csv(out_dir / 'cash_weights.csv', index=False, float_format='%.17g')
+    rebalance_detail.to_csv(out_dir / 'rebalance_detail.csv', index=False, float_format='%.17g')
 
     pd.DataFrame([
         {'trade_date': d, 'holdings': ','.join(h)}
@@ -123,17 +274,23 @@ def run_with_data(config: StrategyConfig, data, out_dir=None) -> dict:
 
     stacked = data.full_returns.stack().rename('index_ret').reset_index()
     stacked.columns = ['trade_date', 'index_code', 'index_ret']
-    stacked.to_csv(out_dir / 'index_returns.csv', index=False)
+    stacked.to_csv(out_dir / 'index_returns.csv', index=False, float_format='%.17g')
 
+    if missing_df is not None:
+        missing_df.to_csv(out_dir / 'missing_returns.csv', index=False)
+        print(f'  missing_returns 已保存: {out_dir / "missing_returns.csv"}（{len(missing_df)} 条）')
+
+    _export_signal_panel(pools, holdings_by_date, out_dir)
     _export_holdings_returns(account, daily_weights, data.full_returns, out_dir)
     print(f'  已保存: {out_dir}')
 
     return {'account': account, 'performance': perf, 'yearly': yearly,
             'diagnostics': diag_df, 'holdings': holdings_by_date,
             'daily_weights': daily_weights, 'cash_weights': cash_weights,
-            'rebalance_detail': rebalance_detail}
+            'rebalance_detail': rebalance_detail,
+            'missing_returns': missing_df}
 
 
-def run(config: StrategyConfig) -> dict:
+def run(config: StrategyConfig, out_dir=None) -> dict:
     data = load_real_data(config)
-    return run_with_data(config, data)
+    return run_with_data(config, data, out_dir=out_dir)

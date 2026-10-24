@@ -1,24 +1,14 @@
 # -*- coding: utf-8 -*-
 """回测引擎。硬约束降仓：预留 top_n 个仓位，缺额保留现金。
 
-权重口径：
-  - weights 是“占当日账户总资产”的比例，sum(weights) + cash_weight = 1
-  - 每日先按持仓收益更新总资产：R_t = sum(w_{t-1} * r_t)
-  - 归一化：w_t = w_{t-1}(1+r_t)/(1+R_t)，cash_t = cash_{t-1}/(1+R_t)
-  - 调仓日：先按旧权重算 R_t 并归一化，再设新权重
-    新持仓等权，总资产仓位 gross = n/top_n，cash = 1 - gross
-
-成本口径：
-  - traded_fraction 是证券买卖金额 / 当日收盘扣费前净资产
-  - fee_fraction = traded_fraction * cost_rate，占当日扣费前净资产
-  - cost = (1 + market_ret) * fee_fraction，换算成占上日净资产
-  - net_ret = market_ret - cost
-  - turnover 含现金，仅用于统计资产配置变化
-
 缺失收益：
   - ret_panel 不 fillna，保留 NaN
-  - 只对实际持仓（weights.index）取收益；有 NaN 直接 raise
-  - “未持仓资产的缺失”（如上市前）不会误报
+  - 旧持仓收益缺失：strict_missing=True 时 raise；False 时记录到 missing_returns
+      * 调仓日旧持仓：reason='zero'，按 0 处理
+      * 非调仓日旧持仓：reason='filled_price_ffill'，
+        用 price_panel 前向填充收盘价后重算收益（不是 ffill 日收益率）
+  - 新持仓收益缺失：调仓时剔除
+  - missing_returns 记录 (trade_date, index_code, reason, context)
 """
 from typing import Dict, List
 
@@ -31,14 +21,24 @@ def run_backtest(holdings_by_date: Dict[pd.Timestamp, List[str]],
                  trading_calendar: pd.DatetimeIndex,
                  cost_rate: float = 0.001,
                  top_n: int = 5,
+                 gross_override: Dict[pd.Timestamp, float] = None,
+                 strict_missing: bool = True,
+                 price_panel: pd.DataFrame = None,
                  return_details: bool = False):
     cal = pd.DatetimeIndex(sorted(trading_calendar))
-    ret_panel = full_returns.reindex(cal)   # 不 fillna，保留 NaN
+    ret_panel = full_returns.reindex(cal)
+
+    # 价格前向填充后重算收益：缺失日收益 = 上一有效收盘到当前有效收盘的累计变动
+    filled_ret = None
+    if price_panel is not None:
+        px = price_panel.reindex(cal).ffill()
+        filled_ret = px.pct_change()
 
     records = []
     weight_rows = []
     cash_rows = []
     rebalance_rows = []
+    missing_returns = []
 
     weights = pd.Series(dtype=float)
     cash_weight = 1.0
@@ -55,12 +55,14 @@ def run_backtest(holdings_by_date: Dict[pd.Timestamp, List[str]],
         if is_rebalance:
             new_holdings = list(holdings_by_date[date])
 
-            # 1) 当日收益按旧权重（含现金，现金收益 0），归一化漂移
             if len(weights) > 0:
                 r_today = ret_panel.loc[date, weights.index]
                 if r_today.isna().any():
                     bad = r_today[r_today.isna()].index.tolist()
-                    raise ValueError(f'{date.date()} 调仓日旧持仓收益缺失: {bad}')
+                    if strict_missing:
+                        raise ValueError(f'{date.date()} 调仓日旧持仓收益缺失: {bad}')
+                    missing_returns.extend((date, c, 'zero', 'rebalance_old') for c in bad)
+                    r_today = r_today.fillna(0.0)
                 market_ret = float((weights * r_today).sum())
                 denom = 1.0 + market_ret
                 drifted = weights * (1 + r_today) / denom
@@ -69,13 +71,20 @@ def run_backtest(holdings_by_date: Dict[pd.Timestamp, List[str]],
                 drifted = pd.Series(dtype=float)
                 cash_drifted = cash_weight
 
+            if new_holdings and date in ret_panel.index:
+                r_new = ret_panel.loc[date]
+                new_holdings = [c for c in new_holdings
+                                if c in r_new.index and pd.notna(r_new[c])]
+
             if new_holdings:
                 n = len(new_holdings)
-                gross = min(n / top_n, 1.0)
+                if gross_override is not None and date in gross_override:
+                    gross = float(gross_override[date])
+                else:
+                    gross = min(n / top_n, 1.0)
                 new_w = pd.Series(gross / n, index=new_holdings)
                 new_cash = 1.0 - gross
 
-                # 2) turnover 含现金（统计用）
                 old_full = pd.concat([drifted, pd.Series({'__cash__': cash_drifted})])
                 new_full = pd.concat([new_w, pd.Series({'__cash__': new_cash})])
                 all_codes = old_full.index.union(new_full.index)
@@ -83,7 +92,6 @@ def run_backtest(holdings_by_date: Dict[pd.Timestamp, List[str]],
                            old_full.reindex(all_codes).fillna(0))
                 turnover = float(dw_full.abs().sum() / 2.0)
 
-                # 3) 成本：只对证券买卖计费，基数换算到上日净资产
                 sec_codes = drifted.index.union(new_w.index)
                 traded_fraction = float(
                     (new_w.reindex(sec_codes).fillna(0) -
@@ -109,7 +117,6 @@ def run_backtest(holdings_by_date: Dict[pd.Timestamp, List[str]],
                 })
                 weights, cash_weight = new_w, new_cash
             else:
-                # 空仓：清掉全部证券，现金 100%
                 if len(drifted) > 0:
                     traded_fraction = float(drifted.abs().sum())
                     old_full = pd.concat([drifted, pd.Series({'__cash__': cash_drifted})])
@@ -146,10 +153,23 @@ def run_backtest(holdings_by_date: Dict[pd.Timestamp, List[str]],
 
         else:
             if len(weights) > 0:
-                r_today = ret_panel.loc[date, weights.index]
-                if r_today.isna().any():
-                    bad = r_today[r_today.isna()].index.tolist()
-                    raise ValueError(f'{date.date()} 持仓收益缺失: {bad}')
+                # 核心修改：如果提供了价格面板，统一使用价格重算的收益
+                if filled_ret is not None:
+                    r_today = filled_ret.loc[date, weights.index]
+                    
+                    # 记录哪些是原始数据中缺失的（供日志审计）
+                    r_orig = ret_panel.loc[date, weights.index]
+                    if r_orig.isna().any():
+                        bad = r_orig[r_orig.isna()].index.tolist()
+                        missing_returns.extend((date, c, 'filled_price_ffill', 'hold') for c in bad)
+                else:
+                    # 如果没有提供价格面板，退回到原来的逻辑
+                    r_today = ret_panel.loc[date, weights.index]
+                    if r_today.isna().any():
+                        bad = r_today[r_today.isna()].index.tolist()
+                        missing_returns.extend((date, c, 'filled_price_ffill', 'hold') for c in bad)
+                        r_today = r_today.fillna(0.0)
+                
                 market_ret = float((weights * r_today).sum())
                 denom = 1.0 + market_ret
                 weights = weights * (1 + r_today) / denom
@@ -169,10 +189,18 @@ def run_backtest(holdings_by_date: Dict[pd.Timestamp, List[str]],
         cash_rows.append({'trade_date': date, 'cash_weight': cash_weight})
 
     account = pd.DataFrame(records).set_index('trade_date')
+
+    if missing_returns:
+        print(f'  警告: 持仓收益缺失 {len(missing_returns)} 条')
+        print(f'  {pd.Series([m[2] for m in missing_returns]).value_counts().to_dict()}')
+
     if not return_details:
         return account
 
     daily_weights = pd.DataFrame(weight_rows)
     cash_weights = pd.DataFrame(cash_rows)
     rebalance_detail = pd.DataFrame(rebalance_rows)
-    return account, daily_weights, cash_weights, rebalance_detail
+    missing_df = pd.DataFrame(missing_returns,
+                              columns=['trade_date', 'index_code',
+                                       'reason', 'context'])
+    return account, daily_weights, cash_weights, rebalance_detail, missing_df
