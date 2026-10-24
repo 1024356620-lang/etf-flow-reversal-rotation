@@ -114,21 +114,38 @@ def main() -> bool:
         print('  上日权重 > 0 的资产原始收益全部存在且有限。')
 
     # ================= [A2] 实际记账收益完整性 =================
-    print('\n[A2] 实际记账收益完整性（确保无 NaN 污染）')
-    
-    # 只有“上日也有持仓”的日期，当天才有持仓收益需要记录
-    has_holding_dates = set()
-    for i, d in enumerate(all_dates):
-        if acct.loc[d, 'n_holdings'] > 0 and i > 0 and acct.iloc[i-1]['n_holdings'] > 0:
-            has_holding_dates.add(d)
-            
-    actual_dates = set(ret_actual.index)
-    
-    missing_dates = list(has_holding_dates - actual_dates)
-    if missing_dates:
-        fail(f'actual_returns 未覆盖 {len(missing_dates)} 个有持仓的账本日期，示例 {missing_dates[:5]}')
-    else:
-        print('  actual_returns 覆盖所有有效持仓的账本日期。')
+    print('\n[A2] 实际记账收益完整性')
+    missing_actual = []
+
+    for d in all_dates[1:]:
+        # 当天是否持仓不影响检查：清仓日也要计算旧持仓收益
+        pw = prev_weights.loc[d]
+        held_codes = pw.index[pw > 0]
+
+        if len(held_codes) == 0:
+            continue
+
+        r_today = (
+            ret_actual.loc[d]
+            if d in ret_actual.index
+            else pd.Series(dtype=float)
+        )
+
+        values = r_today.reindex(held_codes)
+        bad = values[~np.isfinite(values)]
+
+        missing_actual.extend((d, code) for code in bad.index)
+
+    if missing_actual:
+        fail(
+            f'实际记账收益缺失或非有限，共 {len(missing_actual)} 条，'
+            f'示例：{missing_actual[:10]}'
+        )
+        # 禁止继续用 fillna(0) 掩盖缺失
+        print('\n结论: FAIL')
+        return False
+
+    print('  所有上一日持仓资产的当日实际收益均存在且有限，包含清仓日。')
 
     # ================= [B] market_ret 复算 =================
     print('\n[B] market_ret 复算（使用实际记账收益）')

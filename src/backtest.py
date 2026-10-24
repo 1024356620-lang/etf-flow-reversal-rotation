@@ -192,6 +192,9 @@ def run_backtest(holdings_by_date: Dict[pd.Timestamp, List[str]],
     cash_weights = pd.DataFrame(cash_rows)
     rebalance_detail = pd.DataFrame(rebalance_rows)
     missing_df = pd.DataFrame(missing_returns, columns=['trade_date', 'index_code', 'reason', 'context'])
-    actual_ret_df = pd.DataFrame(actual_returns_rows)
+    actual_ret_df = pd.DataFrame(
+        actual_returns_rows,
+        columns=['trade_date', 'index_code', 'actual_ret'],
+    )
 
     return account, daily_weights, cash_weights, rebalance_detail, missing_df, actual_ret_df
