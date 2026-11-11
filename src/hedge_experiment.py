@@ -1,4 +1,4 @@
-"""Replay ETF strategy A with a CSI 300 spot-return hedge proxy."""
+"""使用沪深300现货收益模拟空头，逐日回放 ETF 轮动方案 A。"""
 import argparse
 from pathlib import Path
 
@@ -12,7 +12,7 @@ def read_inputs(directory, returns_path):
                            dtype={'holdings': str}).set_index('trade_date')
     if (not account.index.is_unique or not account.index.is_monotonic_increasing
             or not holdings.index.is_unique or not holdings.index.isin(account.index).all()):
-        raise ValueError('Invalid accounting or rebalance calendar')
+        raise ValueError('请检查账本日期的顺序与唯一性，并确认调仓日均在账本中且未重复')
     picks = {date: value.split(',') if pd.notna(value) else []
              for date, value in holdings.holdings.items()}
     codes = sorted({code for names in picks.values() for code in names} | {'000300'})
@@ -21,12 +21,12 @@ def read_inputs(directory, returns_path):
     data = pd.concat(chunk.loc[chunk.index_code.isin(codes)] for chunk in chunks)
     prices = data.pivot(index='trade_date', columns='index_code', values='index_ret')
     prices = prices.reindex(index=account.index, columns=codes)
-    # The first close has no prior return and the account starts in cash.
+    # 首日没有前收盘价，账户以现金起步。
     market = prices['000300'].copy()
     if pd.isna(market.iloc[0]):
         market.iloc[0] = 0
     if not np.isfinite(market).all():
-        raise ValueError('Incomplete CSI 300 history')
+        raise ValueError('沪深300日收益序列存在缺失或非有限值')
     audit_path = directory / 'actual_returns.csv'
     if audit_path.exists():
         audit = pd.read_csv(audit_path, parse_dates=['trade_date'], dtype={'index_code': str})
@@ -35,7 +35,7 @@ def read_inputs(directory, returns_path):
     schedule = {}
     for date, names in picks.items():
         if len(names) > 5 or len(names) != len(set(names)):
-            raise ValueError(f'Invalid A holdings on {date}')
+            raise ValueError(f'{date} 的 A 方案持仓有重复或超过五只')
         schedule[account.index.get_loc(date)] = prices.columns.get_indexer(names)
     return account, prices.to_numpy(), market, schedule
 
@@ -46,7 +46,7 @@ def replay(returns, market, schedule, long_scale, hedge_ratio=0., annual_drag=0.
     rows = []
     for day, (asset_returns, market_return) in enumerate(zip(returns, market)):
         if not np.isfinite(asset_returns[weights != 0]).all():
-            raise ValueError(f'Missing invested return on {market.index[day]}')
+            raise ValueError(f'{market.index[day]} 的持仓收益缺失或非有限')
         asset_returns = np.where(weights != 0, asset_returns, 0.)
         growth = 1 + weights @ asset_returns - short * (market_return + annual_drag / 252)
         weights = weights * (1 + asset_returns) / growth
@@ -56,7 +56,7 @@ def replay(returns, market, schedule, long_scale, hedge_ratio=0., annual_drag=0.
             target = np.zeros_like(weights)
             target[schedule[day]] = long_scale / 5
             new_short = target.sum() * hedge_ratio
-            # Each monthly roll closes the old short and opens the new short.
+            # 每月平旧空头、开新空头，分别按名义金额计费。
             fee = .001 * np.abs(target - weights).sum() + .0002 * (short + new_short)
             weights, short = target, new_short
         rows.append((growth * (1 - fee) - 1, weights.sum(), short, growth * fee))
@@ -76,9 +76,9 @@ def metrics(daily, market):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--results-dir', type=Path, default=Path('results_A'))
-    parser.add_argument('--index-returns', type=Path, help='Full CSV or filtered CSV/ZIP')
-    parser.add_argument('--out-dir', type=Path, default=Path('results_hedge'))
+    parser.add_argument('--results-dir', type=Path, default=Path('results_A'), help='原始 A 账本与持仓目录')
+    parser.add_argument('--index-returns', type=Path, help='指数日收益文件，支持完整 CSV、筛选后的 CSV 或单 CSV 压缩包')
+    parser.add_argument('--out-dir', type=Path, default=Path('results_hedge'), help='对冲实验结果目录')
     args = parser.parse_args()
     account, returns, market, schedule = read_inputs(
         args.results_dir, args.index_returns or args.results_dir / 'index_returns.csv')
@@ -87,7 +87,7 @@ def main():
 
     baseline = run(1.)
     np.testing.assert_allclose(baseline.net_ret, account.net_ret, atol=1e-10, rtol=0,
-                               err_msg='A daily ledger reconciliation failed')
+                               err_msg='A 方案逐日净收益与原始账本不一致')
     hedged = run(.8, .5)
     target = metrics(hedged, market)
     scenarios = {'A': baseline, 'A_80pct': run(.8), 'hedge_proxy': hedged,
@@ -95,7 +95,7 @@ def main():
     for metric in ['annual_vol', 'beta']:
         lo, hi = 0., 1.
         if not 0 <= target[metric] <= metrics(baseline, market)[metric]:
-            raise ValueError(f'No fixed-exposure match for {metric}')
+            raise ValueError(f'固定仓位无法匹配目标指标 {metric}')
         for _ in range(24):
             mid = (lo + hi) / 2
             if metrics(run(mid), market)[metric] < target[metric]:
